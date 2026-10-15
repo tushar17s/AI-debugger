@@ -45,6 +45,7 @@ class DebugState(TypedDict, total=False):
     search_terms: list[str]
     search_result: str
     inspected_files: dict[str, str]
+    inspected_excerpts: dict[str, str]
     inspected_hashes: dict[str, str]
     decision: dict[str, Any]
     status: str
@@ -70,6 +71,8 @@ def _project_tree(root: Path) -> str:
         )
         for name in sorted(dirs + files):
             path = current_path / name
+            if path.is_symlink():
+                continue
             if path.is_file() and path.suffix.lower() not in SOURCE_SUFFIXES:
                 continue
             entries.append(path.relative_to(root).as_posix() + ("/" if path.is_dir() else ""))
@@ -92,24 +95,31 @@ def _parse_json(content: Any) -> dict[str, Any]:
     return value
 
 
-def _snippets(root: Path, requested_path: str, terms: list[str]) -> tuple[str, dict[str, str], dict[str, str]]:
+def _snippets(
+    root: Path, requested_path: str, terms: list[str]
+) -> tuple[str, dict[str, str], dict[str, str], dict[str, str]]:
     target = _inside_root(root, requested_path or ".")
     if not target.exists():
-        return f"Path not found: {requested_path}", {}, {}
+        return f"Path not found: {requested_path}", {}, {}, {}
 
     candidates = [target] if target.is_file() else [
         path for path in target.rglob("*")
         if path.is_file()
+        and not path.is_symlink()
         and path.suffix.lower() in SOURCE_SUFFIXES
         and not any(part in IGNORED_DIRS for part in path.relative_to(root).parts)
     ]
-    candidates = [path for path in candidates if path.suffix.lower() in SOURCE_SUFFIXES][:150]
+    candidates = sorted(
+        path for path in candidates
+        if path.suffix.lower() in SOURCE_SUFFIXES and not path.is_symlink()
+    )[:150]
     needles = [term.strip().casefold() for term in terms[:8] if term.strip()]
     if not needles:
-        return "No search terms were provided.", {}, {}
+        return "No search terms were provided.", {}, {}, {}
 
     excerpts: list[str] = []
     inspected: dict[str, str] = {}
+    inspected_excerpts: dict[str, str] = {}
     hashes: dict[str, str] = {}
     used_chars = 0
     for path in candidates:
@@ -126,8 +136,6 @@ def _snippets(root: Path, requested_path: str, terms: list[str]) -> tuple[str, d
         ]
         if not hit_lines:
             continue
-        inspected[relative] = text
-        hashes[relative] = hashlib.sha256(raw).hexdigest()
         windows: list[tuple[int, int]] = []
         for index in hit_lines:
             start, end = max(0, index - 3), min(len(lines), index + 4)
@@ -135,23 +143,32 @@ def _snippets(root: Path, requested_path: str, terms: list[str]) -> tuple[str, d
                 windows[-1] = (windows[-1][0], max(windows[-1][1], end))
             else:
                 windows.append((start, end))
+        file_excerpts: list[str] = []
         for start, end in windows[:3]:
+            source_excerpt = "\n".join(lines[start:end])
             excerpt = f"--- {relative}:{start + 1} ---\n" + "\n".join(
                 f"{number + 1}: {lines[number]}" for number in range(start, end)
             )
             if used_chars + len(excerpt) > MAX_CONTEXT_CHARS:
                 break
             excerpts.append(excerpt)
+            file_excerpts.append(source_excerpt)
             used_chars += len(excerpt)
+        if file_excerpts:
+            inspected[relative] = text
+            inspected_excerpts[relative] = "\n\n".join(file_excerpts)
+            hashes[relative] = hashlib.sha256(raw).hexdigest()
         if used_chars >= MAX_CONTEXT_CHARS:
             break
 
     if not excerpts:
-        return f"No matching code found under {requested_path} for terms: {', '.join(needles)}", {}, {}
-    return "\n\n".join(excerpts), inspected, hashes
+        return f"No matching code found under {requested_path} for terms: {', '.join(needles)}", {}, {}, {}
+    return "\n\n".join(excerpts), inspected, inspected_excerpts, hashes
 
 
-def _validate_edits(edits: Any, inspected: dict[str, str]) -> tuple[list[dict[str, str]], str | None]:
+def _validate_edits(
+    edits: Any, inspected: dict[str, str], excerpts: dict[str, str]
+) -> tuple[list[dict[str, str]], str | None]:
     if not isinstance(edits, list) or not edits:
         return [], "The proposed fix contains no exact edits."
     valid: list[dict[str, str]] = []
@@ -164,9 +181,13 @@ def _validate_edits(edits: Any, inspected: dict[str, str]) -> tuple[list[dict[st
             return [], "Each edit needs a path, a non-empty old string, and a new string."
         if path not in inspected:
             return [], f"The model proposed editing a file that was not inspected: {path}"
-        source = inspected[path]
-        if source.count(old) != 1:
+        source = inspected[path].replace("\r\n", "\n").replace("\r", "\n")
+        normalized_old = old.replace("\r\n", "\n").replace("\r", "\n")
+        if source.count(normalized_old) != 1:
             return [], f"The old text for {path} must occur exactly once in the inspected file."
+        excerpt = excerpts.get(path, "").replace("\r\n", "\n").replace("\r", "\n")
+        if normalized_old not in excerpt:
+            return [], f"The old text for {path} was not included in the model's search excerpts."
         key = (path, old)
         if key in seen:
             return [], f"Duplicate edit for {path}."
@@ -177,8 +198,11 @@ def _validate_edits(edits: Any, inspected: dict[str, str]) -> tuple[list[dict[st
 
 def _apply_edits(source: str, edits: list[dict[str, str]]) -> str:
     updated = source
+    newline = "\r\n" if "\r\n" in source else "\r" if "\r" in source else "\n"
     for edit in edits:
-        updated = updated.replace(edit["old"], edit["new"], 1)
+        old = edit["old"].replace("\r\n", "\n").replace("\r", "\n").replace("\n", newline)
+        new = edit["new"].replace("\r\n", "\n").replace("\r", "\n").replace("\n", newline)
+        updated = updated.replace(old, new, 1)
     return updated
 
 
@@ -217,7 +241,11 @@ Previous search result:
                 "search_terms": [str(term)[:80] for term in terms[:8]],
             }
         if action == "propose":
-            edits, error = _validate_edits(decision.get("edits"), state.get("inspected_files", {}))
+            edits, error = _validate_edits(
+                decision.get("edits"),
+                state.get("inspected_files", {}),
+                state.get("inspected_excerpts", {}),
+            )
             if error:
                 return {
                     "decision": {"action": "search"},
@@ -230,15 +258,16 @@ Previous search result:
     def search(state: DebugState) -> DebugState:
         root = Path(state["root"])
         try:
-            result, inspected, hashes = _snippets(
+            result, inspected, excerpts, hashes = _snippets(
                 root, state.get("search_path", "."), state.get("search_terms", [])
             )
         except (OSError, ValueError) as exc:
-            result, inspected, hashes = f"Search failed safely: {exc}", {}, {}
+            result, inspected, excerpts, hashes = f"Search failed safely: {exc}", {}, {}, {}
         return {
             "attempts": state.get("attempts", 0) + 1,
             "search_result": result,
             "inspected_files": inspected,
+            "inspected_excerpts": excerpts,
             "inspected_hashes": hashes,
         }
 
@@ -267,7 +296,9 @@ Previous search result:
             except UnicodeDecodeError:
                 return {"status": f"aborted: {relative} is no longer valid UTF-8; no changes were applied"}
             for edit in edits:
-                if original.count(edit["old"]) != 1:
+                normalized_original = original.replace("\r\n", "\n").replace("\r", "\n")
+                normalized_old = edit["old"].replace("\r\n", "\n").replace("\r", "\n")
+                if normalized_original.count(normalized_old) != 1:
                     return {"status": f"aborted: exact text check failed for {relative}; no changes were applied"}
             originals[relative] = original
 
