@@ -50,6 +50,10 @@ class DebugState(TypedDict, total=False):
     decision: dict[str, Any]
     status: str
     test_suggestion: str
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    token_usage_available: bool
 
 
 def _inside_root(root: Path, relative_path: str) -> Path:
@@ -93,6 +97,20 @@ def _parse_json(content: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("Expected a JSON object from the model.")
     return value
+
+
+def _response_token_usage(response: Any) -> tuple[int, int, int] | None:
+    usage = getattr(response, "usage_metadata", None)
+    if not isinstance(usage, dict) or not usage:
+        metadata = getattr(response, "response_metadata", {})
+        usage = metadata.get("token_usage") if isinstance(metadata, dict) else None
+    if not isinstance(usage, dict) or not usage:
+        return None
+
+    input_tokens = int(usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0)
+    output_tokens = int(usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0)
+    total_tokens = int(usage.get("total_tokens", input_tokens + output_tokens) or 0)
+    return input_tokens, output_tokens, total_tokens
 
 
 def _snippets(
@@ -229,6 +247,17 @@ Previous search result:
 {state.get('search_result', '(none yet)')}
 """
         response = model.invoke(decision_prompt)
+        usage = _response_token_usage(response)
+        if usage is None:
+            token_update: dict[str, Any] = {"token_usage_available": False}
+        else:
+            input_tokens, output_tokens, total_tokens = usage
+            token_update = {
+                "input_tokens": state.get("input_tokens", 0) + input_tokens,
+                "output_tokens": state.get("output_tokens", 0) + output_tokens,
+                "total_tokens": state.get("total_tokens", 0) + total_tokens,
+                "token_usage_available": state.get("token_usage_available", True),
+            }
         decision = _parse_json(response.content)
         action = decision.get("action")
         if action == "search":
@@ -236,6 +265,7 @@ Previous search result:
             if not isinstance(terms, list):
                 terms = []
             return {
+                **token_update,
                 "decision": decision,
                 "search_path": str(decision.get("path", ".")),
                 "search_terms": [str(term)[:80] for term in terms[:8]],
@@ -248,12 +278,16 @@ Previous search result:
             )
             if error:
                 return {
+                    **token_update,
                     "decision": {"action": "search"},
                     "search_result": f"Previous proposed fix rejected: {error}",
                 }
             decision["edits"] = edits
-            return {"decision": decision}
-        return {"decision": {"action": "stop", "feedback": "The model returned an unsupported action."}}
+            return {**token_update, "decision": decision}
+        return {
+            **token_update,
+            "decision": {"action": "stop", "feedback": "The model returned an unsupported action."},
+        }
 
     def search(state: DebugState) -> DebugState:
         root = Path(state["root"])
@@ -354,10 +388,24 @@ def main() -> None:
         temperature=0,
     )
     result = build_graph(model).invoke(
-        {"root": str(root), "bug_report": bug_report, "attempts": 0, "status": "investigating"}
+        {
+            "root": str(root),
+            "bug_report": bug_report,
+            "attempts": 0,
+            "status": "investigating",
+            "token_usage_available": True,
+        }
     )
     status = result.get("status", "no evidence-backed fix found")
     print(f"\nResult: {status}")
+    if result.get("token_usage_available"):
+        print(
+            "Token usage: "
+            f"{result.get('total_tokens', 0)} total "
+            f"({result.get('input_tokens', 0)} input, {result.get('output_tokens', 0)} output)"
+        )
+    else:
+        print("Token usage: unavailable from the model response")
     if status == "applied":
         print("Tests were not run. Suggested check: " + result.get("test_suggestion", ""))
     elif result.get("attempts", 0) >= 3:

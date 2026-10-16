@@ -20,4 +20,6 @@ Run the script from the project root, enter the bug report, and review the cause
 
 Tests are not executed in this version. The model can suggest a focused test, but review and run it yourself; an automated test tool can be added later.
 
+After each run, the CLI reports cumulative input, output, and total tokens across its model calls when the provider returns usage metadata. This is per-run usage, not account-wide Groq usage.
+
 Revoke and replace any API key that has been pasted into chat, source control, or another shared location.
